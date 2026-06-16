@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-recon_watch_multi.py
+recon_pipeline.py
 
 Program-aware recon pipeline for authorized security testing / bug bounty work.
 
@@ -14,7 +14,11 @@ What it does:
 
 Run it from a Linux service or timer to control scheduling externally.
 
-Telegram credentials are loaded from a .secret file beside this script:
+Configuration is loaded from a .env file beside this script:
+  TARGETS_DIR=targets
+  DB_PATH=recon.db
+  WORKDIR=work
+  LOG_FILE=logs/recon_pipeline.log
   TELEGRAM_BOT_TOKEN=your_bot_token
   TELEGRAM_CHAT_ID=your_chat_id
 
@@ -80,6 +84,9 @@ class Config:
     httpx_timeout: int = 1800
     naabu_timeout: int = 3600
     nuclei_timeout: int = 3600
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 # -----------------------------
@@ -275,6 +282,61 @@ def write_lines(path: Path, lines: Iterable[str]) -> None:
     path.write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
 
 
+def parse_domain_input(value: str) -> list[str]:
+    domains: list[str] = []
+    seen: set[str] = set()
+    for item in value.replace(",", " ").split():
+        domain = item.strip().rstrip(".")
+        if not domain or domain.startswith("#"):
+            continue
+        if domain not in seen:
+            seen.add(domain)
+            domains.append(domain)
+    return domains
+
+
+def default_program_name(domains: list[str]) -> str:
+    if not domains:
+        return "default"
+    parts = domains[0].split(".")
+    if len(parts) >= 2:
+        return safe_name(parts[-2])
+    return safe_name(domains[0])
+
+
+def ensure_initial_targets(targets_dir: Path) -> None:
+    if any(p.is_file() for p in targets_dir.glob("*.txt")):
+        return
+
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            f"No target files found in {targets_dir}. "
+            "Run the script interactively once to create the first target, "
+            "or create a targets/<program>.txt file manually."
+        )
+
+    print("No target files found. First-run target setup.")
+    domains: list[str] = []
+    while not domains:
+        raw_domains = input("Enter root domain(s), separated by comma or space: ").strip()
+        domains = parse_domain_input(raw_domains)
+        if not domains:
+            print("Please enter at least one domain.")
+
+    suggested_name = default_program_name(domains)
+    raw_name = input(f"Program name [{suggested_name}]: ").strip()
+    program_name = safe_name(raw_name or suggested_name)
+    target_file = targets_dir / f"{program_name}.txt"
+
+    counter = 2
+    while target_file.exists():
+        target_file = targets_dir / f"{program_name}_{counter}.txt"
+        counter += 1
+
+    write_lines(target_file, domains)
+    print(f"Created initial target file: {target_file}")
+
+
 def file_sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -334,12 +396,12 @@ def ensure_utf8_text(v: Any) -> str:
         return str(v)
 
 
-def read_secret_file(path: Path) -> dict[str, str]:
+def read_env_file(path: Path) -> dict[str, str]:
     """Read simple KEY=VALUE entries without modifying the process environment."""
     if not path.exists():
         return {}
 
-    secrets: dict[str, str] = {}
+    values: dict[str, str] = {}
     for line_number, raw_line in enumerate(
         path.read_text(encoding="utf-8", errors="ignore").splitlines(),
         start=1,
@@ -357,9 +419,12 @@ def read_secret_file(path: Path) -> dict[str, str]:
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
             value = value[1:-1]
-        secrets[key] = value
+        values[key] = value
 
-    return secrets
+    return values
+
+
+
 
 
 def normalize_url(host: str, url: Optional[str]) -> str:
@@ -1429,7 +1494,7 @@ def parse_args() -> Config:
     args = parser.parse_args()
 
     secret_file = Path(args.secret_file).expanduser()
-    secrets = read_secret_file(secret_file)
+    secrets = read_env_file(secret_file)
     telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", secrets.get("TELEGRAM_BOT_TOKEN", ""))
     telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", secrets.get("TELEGRAM_CHAT_ID", ""))
 
