@@ -76,7 +76,7 @@ import subprocess
 import sys
 import time
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -457,9 +457,9 @@ def sync_targets_dir(conn: sqlite3.Connection, targets_dir: Path) -> list[sqlite
     cur = conn.cursor()
     programs: list[sqlite3.Row] = []
 
-    txt_files = sorted([p for p in targets_dir.glob("*.txt") if p.is_file()])
+    target_files = sorted([p for p in targets_dir.iterdir() if p.is_file() and not p.name.startswith(".")])
 
-    for scope_file in txt_files:
+    for scope_file in target_files:
         program_name = scope_file.stem
         roots = read_lines(scope_file)
         scope_hash = hashlib.sha256("\n".join(sorted(set(roots))).encode("utf-8")).hexdigest()
@@ -802,7 +802,6 @@ def run_naabu(cfg: Config, hosts: list[str], job_dir: Path) -> list[dict[str, An
     cmd = [
         cfg.naabu_bin,
         "-list", str(host_file),
-        "-sV",
         "-json",
         "-silent",
         "-o", str(out_file),
@@ -1005,7 +1004,7 @@ def run_katana(cfg: Config, urls: list[str], job_dir: Path) -> list[str]:
         cfg.katana_bin,
         "-list", str(url_file),
         "-depth", str(cfg.katana_depth),
-        "-json",
+        "-jsonl",
         "-silent",
         "-no-color",
         "-o", str(out_file),
@@ -1421,31 +1420,47 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
 
         if live_hosts or live_urls:
             with ThreadPoolExecutor(max_workers=2) as pool:
-                naabu_future = None
-                katana_future = None
-
+                futures = {}
                 if live_hosts:
                     naabu_future = pool.submit(run_naabu, cfg, live_hosts, job_dir)
+                    futures[naabu_future] = "naabu"
                 if live_urls:
                     katana_future = pool.submit(run_katana, cfg, live_urls, job_dir)
+                    futures[katana_future] = "katana"
 
-                if naabu_future:
-                    port_results = naabu_future.result()
-                    logging.info("[%s] Step 3 - naabu completed successfully", program_name)
-                    logging.info("[%s] Saving file", program_name)
-                    store_ports(conn, program_id, port_results)
-                    logging.info("[%s] Saved in database", program_name)
+                for future in as_completed(futures):
+                    tool_name = futures[future]
+                    if tool_name == "naabu":
+                        port_results = future.result()
+                        logging.info("[%s] Step 3 - naabu completed successfully", program_name)
+                        logging.info("[%s] Saving file", program_name)
+                        store_ports(conn, program_id, port_results)
+                        logging.info("[%s] Saved in database", program_name)
+                        
+                        if cfg.notify_step_by_step:
+                            host_ports: dict[str, list[str]] = {}
+                            for p in port_results:
+                                host = p.get("host")
+                                if host:
+                                    host_ports.setdefault(host, []).append(str(p.get("port")))
+                            
+                            lines = [f"[{program_name}] **Naabu finished**: {len(port_results)} port findings"]
+                            for host, ports in list(host_ports.items())[:10]:
+                                lines.append(f"- {host}: {', '.join(ports)}")
+                            if len(host_ports) > 10:
+                                lines.append(f"...and {len(host_ports) - 10} more hosts")
+                            send_notify(cfg, "\n".join(lines))
 
-                if katana_future:
-                    katana_urls = katana_future.result()
-                    logging.info("[%s] Step 4 - katana completed successfully", program_name)
-                    logging.info("[%s] Saving file", program_name)
-                    katana_parsed = parse_katana_results(job_dir)
-                    store_katana(conn, program_id, katana_parsed)
-                    logging.info("[%s] Saved in database", program_name)
-                    
-            if cfg.notify_step_by_step:
-                send_notify(cfg, f"[{program_name}] **Naabu/Katana finished**: {len(port_results)} port findings, {len(katana_urls)} new URLs crawled.")
+                    elif tool_name == "katana":
+                        katana_urls = future.result()
+                        logging.info("[%s] Step 4 - katana completed successfully", program_name)
+                        logging.info("[%s] Saving file", program_name)
+                        katana_parsed = parse_katana_results(job_dir)
+                        store_katana(conn, program_id, katana_parsed)
+                        logging.info("[%s] Saved in database", program_name)
+                        
+                        if cfg.notify_step_by_step:
+                            send_notify(cfg, f"[{program_name}] **Katana finished**: {len(katana_urls)} new URLs crawled.")
         else:
             logging.info("[%s] no live hosts/urls, skipping naabu and katana", program_name)
 
@@ -1796,7 +1811,8 @@ def main() -> int:
         logging.info("Program name: %s", program_name)
 
     # Check if we have targets to run
-    if not list(cfg.targets_dir.glob("*.txt")):
+    target_files = [p for p in cfg.targets_dir.iterdir() if p.is_file() and not p.name.startswith(".")]
+    if not target_files:
         logging.error("No target files found in '%s'. Add a target via -d <domain>.", cfg.targets_dir)
         return 1
 
