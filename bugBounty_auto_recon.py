@@ -72,6 +72,7 @@ import logging
 import logging.handlers
 import shutil
 import sqlite3
+import shlex
 import subprocess
 import sys
 import time
@@ -122,6 +123,13 @@ class Config:
     katana_timeout: int = 3600
     katana_depth: int = 3
     katana_headless: bool = False
+    katana_crawl_js: bool = True
+    subfinder_args: str = ""
+    httpx_args: str = ""
+    naabu_args: str = ""
+    nuclei_args: str = ""
+    katana_args: str = ""
+    notify_args: str = ""
     max_job_retention_days: int = 30
     dry_run: bool = False
 
@@ -439,6 +447,8 @@ def send_notify(cfg: Config, message: str) -> None:
     cmd = [cfg.notify_bin, "-silent", "-bulk"]
     if cfg.notify_id:
         cmd.extend(["-id", cfg.notify_id])
+    if cfg.notify_args:
+        cmd.extend(shlex.split(cfg.notify_args))
 
     try:
         subprocess.run(
@@ -567,6 +577,9 @@ def run_subfinder(cfg: Config, roots: list[str], job_dir: Path) -> set[str]:
         "-dL", str(roots_file),
         "-silent",
     ]
+    if cfg.subfinder_args:
+        cmd.extend(shlex.split(cfg.subfinder_args))
+        
     proc = run_cmd(cmd, timeout=cfg.subfinder_timeout)
     if proc.returncode != 0 and not proc.stdout.strip():
         logging.error("subfinder failed: %s", proc.stderr.strip())
@@ -649,7 +662,11 @@ def run_httpx(cfg: Config, hosts: list[str], job_dir: Path) -> tuple[list[dict[s
         "-no-color",
         "-silent",
         "-o", str(out_file),
+        "-json",
     ]
+    if cfg.httpx_args:
+        cmd.extend(shlex.split(cfg.httpx_args))
+
     proc = run_cmd(cmd, timeout=cfg.httpx_timeout)
 
     raw_lines: list[str] = []
@@ -826,6 +843,9 @@ def run_naabu(cfg: Config, hosts: list[str], job_dir: Path) -> list[dict[str, An
         "-silent",
         "-o", str(out_file),
     ]
+    if cfg.naabu_args:
+        cmd.extend(shlex.split(cfg.naabu_args))
+
     proc = run_cmd(cmd, timeout=cfg.naabu_timeout)
 
     raw_lines: list[str] = []
@@ -934,9 +954,12 @@ def run_nuclei(cfg: Config, urls: list[str], job_dir: Path) -> list[dict[str, An
         "-severity", cfg.nuclei_severities,
         "-jsonl",
         "-silent",
-        "-no-color",
+        "-ni",
         "-o", str(out_file),
     ]
+    if cfg.nuclei_args:
+        cmd.extend(shlex.split(cfg.nuclei_args))
+
     proc = run_cmd(cmd, timeout=cfg.nuclei_timeout)
 
     raw_lines: list[str] = []
@@ -1047,8 +1070,21 @@ def run_katana(cfg: Config, urls: list[str], job_dir: Path) -> list[str]:
         "-no-color",
         "-o", str(out_file),
     ]
+
+    hosts = {host_from_url(u) for u in urls if host_from_url(u)}
+    if hosts:
+        escaped_hosts = [h.replace(".", "\\.") for h in hosts]
+        regex_pattern = ".*(" + "|".join(escaped_hosts) + ").*"
+        cmd.extend(["-cs", regex_pattern, "-mr", regex_pattern])
+
+    if cfg.katana_crawl_js:
+        cmd.extend(["-jc"])
+
     if cfg.katana_headless:
         cmd.extend(["-headless"])
+        
+    if cfg.katana_args:
+        cmd.extend(shlex.split(cfg.katana_args))
 
     proc = run_cmd(cmd, timeout=cfg.katana_timeout)
 
@@ -1734,6 +1770,13 @@ def load_config() -> Config:
         katana_timeout=int(env["KATANA_TIMEOUT"]),
         katana_depth=int(env["KATANA_DEPTH"]),
         katana_headless=env["KATANA_HEADLESS"].strip().lower() in ("true", "1", "yes"),
+        katana_crawl_js=env.get("KATANA_CRAWL_JS", "true").strip().lower() in ("true", "1", "yes"),
+        subfinder_args=env.get("SUBFINDER_ARGS", ""),
+        httpx_args=env.get("HTTPX_ARGS", ""),
+        naabu_args=env.get("NAABU_ARGS", ""),
+        nuclei_args=env.get("NUCLEI_ARGS", ""),
+        katana_args=env.get("KATANA_ARGS", ""),
+        notify_args=env.get("NOTIFY_ARGS", ""),
         max_job_retention_days=int(env["MAX_JOB_RETENTION_DAYS"]),
         dry_run=env["DRY_RUN"].strip().lower() in ("true", "1", "yes"),
     )
@@ -1815,15 +1858,23 @@ def main() -> int:
     cfg = load_config()
 
     if args.setup:
-        cfg.root_dir.mkdir(parents=True, exist_ok=True)
-        cfg.targets_dir.mkdir(parents=True, exist_ok=True)
-        cfg.workdir.mkdir(parents=True, exist_ok=True)
-        cfg.log_file.parent.mkdir(parents=True, exist_ok=True)
-        connect_db(cfg.db_path).close()
-        
-        setup_logging(cfg.log_file)
-        logging.info("Setup complete. Initialized structure in %s", cfg.root_dir)
-        return 0
+        try:
+            cfg.root_dir.mkdir(parents=True, exist_ok=True)
+            cfg.targets_dir.mkdir(parents=True, exist_ok=True)
+            cfg.workdir.mkdir(parents=True, exist_ok=True)
+            cfg.log_file.parent.mkdir(parents=True, exist_ok=True)
+            connect_db(cfg.db_path).close()
+            
+            setup_logging(cfg.log_file)
+            logging.info("Setup complete. Initialized structure in %s", cfg.root_dir)
+            return 0
+        except PermissionError as e:
+            print(f"FATAL: Permission denied while trying to create directories in '{cfg.root_dir}'.")
+            print("Please ensure you have write permissions or run the setup command with elevated privileges (e.g., sudo).")
+            return 1
+        except Exception as e:
+            print(f"FATAL: An error occurred during setup: {e}")
+            return 1
 
     # Ensure root_dir exists before proceeding to normal execution
     if not cfg.root_dir.exists() or not cfg.targets_dir.exists() or not cfg.workdir.exists() or not cfg.db_path.exists() or not cfg.log_file.parent.exists():
@@ -1875,6 +1926,10 @@ def main() -> int:
         # Clean up old scan artifacts before starting
         cleanup_old_jobs(cfg.workdir, cfg.max_job_retention_days)
         run_cycle(cfg)
+    except KeyboardInterrupt:
+        print("\nScan interrupted by user (Ctrl+C). Exiting gracefully...")
+        logging.info("Scan interrupted by user (KeyboardInterrupt).")
+        return 130
     except subprocess.TimeoutExpired as exc:
         logging.exception("Timeout: %s", exc)
         return 1
