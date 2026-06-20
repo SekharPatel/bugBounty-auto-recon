@@ -39,6 +39,8 @@ Configuration:
     KATANA_TIMEOUT       - Katana crawling timeout in seconds (default: 3600)
     KATANA_DEPTH         - Katana crawl depth (default: 3)
     KATANA_HEADLESS      - Enable katana headless browser mode (default: false)
+    KATANA_FIELD_SCOPE   - Field scope for katana (-fs) (default: rdn)
+    KATANA_CUSTOM_SCOPE  - Custom scope for katana (-cs) (default: empty)
     MAX_JOB_RETENTION_DAYS - Auto-delete scan artifacts older than N days (default: 30, 0=disable)
     DRY_RUN              - Skip external tool execution for testing (default: false)
 
@@ -124,6 +126,8 @@ class Config:
     katana_depth: int = 3
     katana_headless: bool = False
     katana_crawl_js: bool = True
+    katana_field_scope: str = "rdn"
+    katana_custom_scope: str = ""
     subfinder_args: str = ""
     httpx_args: str = ""
     naabu_args: str = ""
@@ -1049,7 +1053,7 @@ def store_nuclei(conn: sqlite3.Connection, program_id: int, findings: list[dict[
 # katana
 # -----------------------------
 
-def run_katana(cfg: Config, urls: list[str], job_dir: Path) -> list[str]:
+def run_katana(cfg: Config, urls: list[str], job_dir: Path, roots: list[str] = None) -> list[str]:
     """Crawl live URLs with katana and return discovered endpoint URLs."""
     if not urls:
         return []
@@ -1071,11 +1075,11 @@ def run_katana(cfg: Config, urls: list[str], job_dir: Path) -> list[str]:
         "-o", str(out_file),
     ]
 
-    hosts = {host_from_url(u) for u in urls if host_from_url(u)}
-    if hosts:
-        escaped_hosts = [h.replace(".", "\\.") for h in hosts]
-        regex_pattern = ".*(" + "|".join(escaped_hosts) + ").*"
-        cmd.extend(["-cs", regex_pattern, "-mr", regex_pattern])
+    if cfg.katana_field_scope:
+        cmd.extend(["-fs", cfg.katana_field_scope])
+
+    if cfg.katana_custom_scope:
+        cmd.extend(["-cs", cfg.katana_custom_scope])
 
     if cfg.katana_crawl_js:
         cmd.extend(["-jc"])
@@ -1114,20 +1118,25 @@ def run_katana(cfg: Config, urls: list[str], job_dir: Path) -> list[str]:
         except Exception:
             # Plain URL line (non-JSON mode fallback)
             if line.startswith("http"):
-                if line not in seen:
+                host = host_from_url(line)
+                is_valid = any(host == r or host.endswith("." + r) for r in roots) if roots else True
+                if is_valid and line not in seen:
                     seen.add(line)
                     discovered_urls.append(line)
             continue
 
         endpoint = _katana_endpoint(obj)
-        if endpoint.startswith("http") and endpoint not in seen:
-            seen.add(endpoint)
-            discovered_urls.append(endpoint)
+        if endpoint.startswith("http"):
+            host = host_from_url(endpoint)
+            is_valid = any(host == r or host.endswith("." + r) for r in roots) if roots else True
+            if is_valid and endpoint not in seen:
+                seen.add(endpoint)
+                discovered_urls.append(endpoint)
 
     return discovered_urls
 
 
-def parse_katana_results(job_dir: Path) -> list[dict[str, Any]]:
+def parse_katana_results(job_dir: Path, roots: list[str] = None) -> list[dict[str, Any]]:
     """Parse katana JSONL output into structured dicts for DB storage."""
     out_file = job_dir / "katana.jsonl"
     if not out_file.exists():
@@ -1144,6 +1153,10 @@ def parse_katana_results(job_dir: Path) -> list[dict[str, Any]]:
             continue
 
         endpoint = _katana_endpoint(obj)
+        host = host_from_url(endpoint)
+        is_valid = any(host == r or host.endswith("." + r) for r in roots) if roots else True
+        if not is_valid:
+            continue
         if not endpoint:
             continue
 
@@ -1504,7 +1517,7 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
                     naabu_future = pool.submit(run_naabu, cfg, live_hosts, job_dir)
                     futures[naabu_future] = "naabu"
                 if live_urls:
-                    katana_future = pool.submit(run_katana, cfg, live_urls, job_dir)
+                    katana_future = pool.submit(run_katana, cfg, live_urls, job_dir, roots)
                     futures[katana_future] = "katana"
 
                 for future in as_completed(futures):
@@ -1534,7 +1547,7 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
                         katana_urls = future.result()
                         logging.info("[%s] Step 4 - katana completed successfully", program_name)
                         logging.info("[%s] Saving file", program_name)
-                        katana_parsed = parse_katana_results(job_dir)
+                        katana_parsed = parse_katana_results(job_dir, roots)
                         store_katana(conn, program_id, katana_parsed)
                         logging.info("[%s] Saved in database", program_name)
                         
@@ -1674,8 +1687,9 @@ REQUIRED_ENV_KEYS = {
     "NUCLEI_SEVERITIES": "Nuclei severity filter (e.g. medium,high,critical)",
     "KATANA_DEPTH":      "Katana crawl depth (default: 3)",
     "KATANA_HEADLESS":   "Enable katana headless browser mode (true/false)",
-    # Timeouts
-    "SUBFINDER_TIMEOUT": "Subfinder timeout in seconds",
+    "KATANA_FIELD_SCOPE":"Field scope for katana (-fs) (default: rdn)",
+    "KATANA_CUSTOM_SCOPE":"Custom regex scope for katana (-cs) (default: empty)",
+    "SUBFINDER_ARGS":    "Extra subfinder args (e.g. '-all -active')",
     "HTTPX_TIMEOUT":     "HTTPX timeout in seconds",
     "NAABU_TIMEOUT":     "Naabu timeout in seconds",
     "NUCLEI_TIMEOUT":    "Nuclei timeout in seconds",
@@ -1694,6 +1708,18 @@ TIMEOUT_KEYS = {
     "MAX_JOB_RETENTION_DAYS",
 }
 
+# Keys that are allowed to be empty or missing
+ALLOW_EMPTY_KEYS = {
+    "NOTIFY_ID",
+    "KATANA_CUSTOM_SCOPE",
+    "SUBFINDER_ARGS",
+    "HTTPX_ARGS",
+    "NAABU_ARGS",
+    "NUCLEI_ARGS",
+    "KATANA_ARGS",
+    "NOTIFY_ARGS",
+}
+
 
 def validate_env(env: dict[str, str], env_file: Path) -> None:
     """Check that every required key is present, non-empty, and valid. Exit with clear error if not."""
@@ -1703,9 +1729,11 @@ def validate_env(env: dict[str, str], env_file: Path) -> None:
 
     for key, description in REQUIRED_ENV_KEYS.items():
         if key not in env:
-            missing.append(f"  {key:25s} - {description}")
+            if key not in ALLOW_EMPTY_KEYS:
+                missing.append(f"  {key:25s} - {description}")
         elif not env[key].strip() or env[key].strip().startswith("your_"):
-            empty.append(f"  {key:25s} - {description} (current: '{env[key]}')")
+            if key not in ALLOW_EMPTY_KEYS:
+                empty.append(f"  {key:25s} - {description} (current: '{env[key]}')")
         elif key in TIMEOUT_KEYS:
             try:
                 val = int(env[key])
@@ -1771,6 +1799,8 @@ def load_config() -> Config:
         katana_depth=int(env["KATANA_DEPTH"]),
         katana_headless=env["KATANA_HEADLESS"].strip().lower() in ("true", "1", "yes"),
         katana_crawl_js=env.get("KATANA_CRAWL_JS", "true").strip().lower() in ("true", "1", "yes"),
+        katana_field_scope=env.get("KATANA_FIELD_SCOPE", "rdn"),
+        katana_custom_scope=env.get("KATANA_CUSTOM_SCOPE", ""),
         subfinder_args=env.get("SUBFINDER_ARGS", ""),
         httpx_args=env.get("HTTPX_ARGS", ""),
         naabu_args=env.get("NAABU_ARGS", ""),
