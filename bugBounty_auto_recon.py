@@ -379,14 +379,25 @@ def read_lines(path: Path) -> list[str]:
 
 def run_cmd(cmd: list[str], timeout: int, cwd: Optional[Path] = None) -> subprocess.CompletedProcess[str]:
     logging.info("Running: %s", " ".join(cmd))
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.error("Timeout: Command '%s' timed out after %s seconds", " ".join(cmd), timeout)
+        out = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout.decode('utf-8', errors='ignore') if exc.stdout else "")
+        err = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr.decode('utf-8', errors='ignore') if exc.stderr else "")
+        return subprocess.CompletedProcess(args=cmd, returncode=124, stdout=out, stderr=err)
+    except Exception as exc:
+        logging.error("Error executing command '%s': %s", " ".join(cmd), exc)
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr=str(exc))
 
 
 def first_value(d: dict[str, Any], keys: list[str], default: Any = None) -> Any:
@@ -458,6 +469,8 @@ def send_notify(cfg: Config, message: str) -> None:
             cmd,
             input=message,
             text=True,
+            encoding="utf-8",
+            errors="ignore",
             timeout=60,
             check=False,
             capture_output=True
@@ -603,6 +616,11 @@ def run_subfinder(cfg: Config, roots: list[str], job_dir: Path) -> set[str]:
                 continue
         else:
             subs.add(s)
+            
+    if subs:
+        out_file = job_dir / "subfinder.txt"
+        out_file.write_text("\n".join(sorted(subs)) + "\n", encoding="utf-8")
+
     return subs
 
 
@@ -671,28 +689,24 @@ def run_httpx(cfg: Config, hosts: list[str], job_dir: Path) -> tuple[list[dict[s
 
     proc = run_cmd(cmd, timeout=cfg.httpx_timeout)
 
-    raw_lines: list[str] = []
     _seen_lines: set[str] = set()
-    
-    _all_lines: list[str] = []
-    if out_file.exists():
-        _all_lines.extend(out_file.read_text(encoding="utf-8", errors="ignore").splitlines())
-    if proc.stdout.strip():
-        _all_lines.extend(proc.stdout.splitlines())
-        
-    for line in _all_lines:
-        line = line.strip()
-        if line and line not in _seen_lines:
-            _seen_lines.add(line)
-            raw_lines.append(line)
+    def iter_lines():
+        if out_file.exists():
+            with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    yield line
+        if proc.stdout:
+            for line in proc.stdout.splitlines():
+                yield line
 
     results: list[dict[str, Any]] = []
     live_hosts: list[str] = []
 
-    for line in raw_lines:
+    for line in iter_lines():
         line = line.strip()
-        if not line:
+        if not line or line in _seen_lines:
             continue
+        _seen_lines.add(line)
         try:
             obj = json.loads(line)
         except Exception:
@@ -877,26 +891,22 @@ def run_naabu(cfg: Config, hosts: list[str], job_dir: Path) -> list[dict[str, An
 
     proc = run_cmd(cmd, timeout=cfg.naabu_timeout)
 
-    raw_lines: list[str] = []
     _seen_lines: set[str] = set()
-    
-    _all_lines: list[str] = []
-    if out_file.exists():
-        _all_lines.extend(out_file.read_text(encoding="utf-8", errors="ignore").splitlines())
-    if proc.stdout.strip():
-        _all_lines.extend(proc.stdout.splitlines())
-        
-    for line in _all_lines:
-        line = line.strip()
-        if line and line not in _seen_lines:
-            _seen_lines.add(line)
-            raw_lines.append(line)
+    def iter_lines():
+        if out_file.exists():
+            with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    yield line
+        if proc.stdout:
+            for line in proc.stdout.splitlines():
+                yield line
 
     results: list[dict[str, Any]] = []
-    for line in raw_lines:
+    for line in iter_lines():
         line = line.strip()
-        if not line:
+        if not line or line in _seen_lines:
             continue
+        _seen_lines.add(line)
         try:
             obj = json.loads(line)
         except Exception:
@@ -1009,26 +1019,22 @@ def run_nuclei(cfg: Config, urls: list[str], job_dir: Path) -> list[dict[str, An
 
     proc = run_cmd(cmd, timeout=cfg.nuclei_timeout)
 
-    raw_lines: list[str] = []
     _seen_lines: set[str] = set()
-    
-    _all_lines: list[str] = []
-    if out_file.exists():
-        _all_lines.extend(out_file.read_text(encoding="utf-8", errors="ignore").splitlines())
-    if proc.stdout.strip():
-        _all_lines.extend(proc.stdout.splitlines())
-        
-    for line in _all_lines:
-        line = line.strip()
-        if line and line not in _seen_lines:
-            _seen_lines.add(line)
-            raw_lines.append(line)
+    def iter_lines():
+        if out_file.exists():
+            with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    yield line
+        if proc.stdout:
+            for line in proc.stdout.splitlines():
+                yield line
 
     findings: list[dict[str, Any]] = []
-    for line in raw_lines:
+    for line in iter_lines():
         line = line.strip()
-        if not line:
+        if not line or line in _seen_lines:
             continue
+        _seen_lines.add(line)
         try:
             obj = json.loads(line)
         except Exception:
@@ -1134,27 +1140,23 @@ def run_katana(cfg: Config, urls: list[str], job_dir: Path, roots: list[str] = N
 
     proc = run_cmd(cmd, timeout=cfg.katana_timeout)
 
-    raw_lines: list[str] = []
     _seen_lines: set[str] = set()
-    
-    _all_lines: list[str] = []
-    if out_file.exists():
-        _all_lines.extend(out_file.read_text(encoding="utf-8", errors="ignore").splitlines())
-    if proc.stdout.strip():
-        _all_lines.extend(proc.stdout.splitlines())
-        
-    for line in _all_lines:
-        line = line.strip()
-        if line and line not in _seen_lines:
-            _seen_lines.add(line)
-            raw_lines.append(line)
+    def iter_lines():
+        if out_file.exists():
+            with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    yield line
+        if proc.stdout:
+            for line in proc.stdout.splitlines():
+                yield line
 
     discovered_urls: list[str] = []
     seen: set[str] = set()
-    for line in raw_lines:
+    for line in iter_lines():
         line = line.strip()
-        if not line:
+        if not line or line in _seen_lines:
             continue
+        _seen_lines.add(line)
         try:
             obj = json.loads(line)
         except Exception:
@@ -1185,38 +1187,39 @@ def parse_katana_results(job_dir: Path, roots: list[str] = None) -> list[dict[st
         return []
 
     results: list[dict[str, Any]] = []
-    for line in out_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
+    with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
 
-        endpoint = _katana_endpoint(obj)
-        host = host_from_url(endpoint)
-        is_valid = any(host == r or host.endswith("." + r) for r in roots) if roots else True
-        if not is_valid:
-            continue
-        if not endpoint:
-            continue
+            endpoint = _katana_endpoint(obj)
+            host = host_from_url(endpoint)
+            is_valid = any(host == r or host.endswith("." + r) for r in roots) if roots else True
+            if not is_valid:
+                continue
+            if not endpoint:
+                continue
 
-        subdomain = host_from_url(endpoint) if endpoint else ""
-        method = str(first_value(obj, ["method"], "")).strip().upper() or "GET"
-        status_code = first_value(obj, ["status_code", "status-code"], None)
-        source = str(first_value(obj, ["source"], "")).strip()
+            subdomain = host_from_url(endpoint) if endpoint else ""
+            method = str(first_value(obj, ["method"], "")).strip().upper() or "GET"
+            status_code = first_value(obj, ["status_code", "status-code"], None)
+            source = str(first_value(obj, ["source"], "")).strip()
 
-        results.append(
-            {
-                "subdomain": subdomain,
-                "url": endpoint,
-                "method": method,
-                "status_code": int(status_code) if isinstance(status_code, (int, float, str)) and str(status_code).isdigit() else None,
-                "source": source,
-                "raw_json": json.dumps(obj, ensure_ascii=False),
-            }
-        )
+            results.append(
+                {
+                    "subdomain": subdomain,
+                    "url": endpoint,
+                    "method": method,
+                    "status_code": int(status_code) if isinstance(status_code, (int, float, str)) and str(status_code).isdigit() else None,
+                    "source": source,
+                    "raw_json": json.dumps(obj, ensure_ascii=False),
+                }
+            )
 
     return results
 
@@ -1641,26 +1644,45 @@ def run_program_cycle(cfg: Config, conn: sqlite3.Connection, program: sqlite3.Ro
         else:
             logging.info("[%s] no live hosts/urls, skipping naabu and katana", program_name)
 
-        # --- Merge live URLs + katana URLs using shell sort -u ---
+        # --- Split Katana URLs and merge with live URLs for Nuclei ---
         nuclei_findings: list[dict[str, Any]] = []
         if live_urls or katana_urls:
             httpx_url_file = job_dir / "httpx_live_urls.txt"
             httpx_url_file.write_text("\n".join(live_urls) + "\n", encoding="utf-8")
 
-            katana_url_file = job_dir / "katana_crawled_urls.txt"
-            katana_url_file.write_text("\n".join(katana_urls) + "\n", encoding="utf-8")
+            katana_js_urls = []
+            katana_param_urls = []
+            katana_normal_urls = []
+            
+            for u in katana_urls:
+                parsed = urllib.parse.urlparse(u)
+                if parsed.path.lower().endswith('.js'):
+                    katana_js_urls.append(u)
+                elif parsed.query:
+                    katana_param_urls.append(u)
+                else:
+                    katana_normal_urls.append(u)
+                    
+            katana_js_file = job_dir / "katana_js_urls.txt"
+            katana_js_file.write_text("\n".join(katana_js_urls) + "\n", encoding="utf-8")
+            
+            katana_param_file = job_dir / "katana_param_urls.txt"
+            katana_param_file.write_text("\n".join(katana_param_urls) + "\n", encoding="utf-8")
+            
+            katana_normal_file = job_dir / "katana_normal_urls.txt"
+            katana_normal_file.write_text("\n".join(katana_normal_urls) + "\n", encoding="utf-8")
 
             merged_url_file = job_dir / "nuclei_urls.txt"
-            merge_cmd = f"cat {httpx_url_file} {katana_url_file} | sort -u > {merged_url_file}"
+            merge_cmd = f"cat {httpx_url_file} {katana_param_file} | sort -u > {merged_url_file}"
             try:
                 subprocess.run(
                     merge_cmd, shell=True, check=True, timeout=60,
-                    capture_output=True, text=True,
+                    capture_output=True, text=True, encoding="utf-8", errors="ignore"
                 )
                 logging.info("[%s] merged URLs via shell sort -u", program_name)
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
                 logging.warning("[%s] shell merge failed, falling back to Python dedup: %s", program_name, exc)
-                all_urls = sorted(set(live_urls + katana_urls))
+                all_urls = sorted(set(live_urls + katana_param_urls))
                 merged_url_file.write_text("\n".join(all_urls) + "\n", encoding="utf-8")
 
             # Read back the deduplicated URLs

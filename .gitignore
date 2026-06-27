@@ -2,3 +2,4 @@
 __pycache__/
 *.py[cod]
 recon_data_test/
+.venv/
